@@ -2,7 +2,7 @@
 
 `implement-spec` takes a [spec](https://www.aihero.dev/ai-coding-dictionary/spec) and its [tickets](https://www.aihero.dev/ai-coding-dictionary/ticket) and lands the whole thing in one run. The orchestrating [agent](https://www.aihero.dev/ai-coding-dictionary/agent) hands each ticket to an implementer [subagent](https://www.aihero.dev/ai-coding-dictionary/subagent) working in its own git worktree, merges each finished branch into a single **integration branch**, runs [code-review](https://aihero.dev/skills-code-review) over the result, and resolves the tickets.
 
-It reads the tickets as a **task graph**, not a list. Blocking edges decide what can start, so at any moment there is a **frontier** of tickets whose blockers have all landed, and every ticket on the frontier runs at once. That is the difference from working the tickets one by one. The graph's shape sets the pace, not the tickets' order on the tracker.
+It reads the tickets as a **task graph**, not a list. Blocking edges decide what can start, so at any moment there is a **frontier** of tickets whose blockers have all landed, and ready tickets run together when they change independent files and interfaces. Overlapping work runs sequentially. That is the difference from working the tickets one by one. The graph's shape sets the pace, not the tickets' order on the tracker.
 
 ## When to reach for it
 
@@ -18,7 +18,7 @@ You invoke this by typing `/implement-spec`, and the agent won't reach for it on
 ## Prerequisites
 
 - **An issue tracker.** The skill reads the tickets from, and resolves them on, the tracker [setup-matt-pocock-skills](https://aihero.dev/skills-setup-matt-pocock-skills) configured. If none has been configured, it stops and tells you to run that first rather than guessing.
-- **Tickets with blocking edges**, as [to-tickets](https://aihero.dev/skills-to-tickets) writes them. Without edges the graph is flat and every ticket starts at once.
+- **Tickets with blocking edges**, as [to-tickets](https://aihero.dev/skills-to-tickets) writes them. Without edges the graph is flat, but overlapping write surfaces still limit concurrency.
 - **A [harness](https://www.aihero.dev/ai-coding-dictionary/harness) that runs subagents in the background and gives each one a git worktree.** The skill exists to run tickets at the same time, so on a harness that runs subagents one at a time, it is only a slower `implement`.
 
 ## The integration branch
@@ -27,7 +27,9 @@ Everything lands on one branch. Each implementer:
 
 1. confirms its worktree is based on the integration branch before it starts,
 2. builds its ticket with [tdd](https://aihero.dev/skills-tdd), red-green one slice at a time,
-3. merges the integration branch tip into its own branch before reporting done, so landing it is a fast-forward.
+3. merges the integration branch tip into its own branch, resolves conflicts, and runs required verification before handing off clean, committed work.
+
+Acceptance checklists track the spec and each ticket through final verification and review. Plan approval and intermediate wave reviews apply when you request them or the repository requires them; a separate delivery policy is not required.
 
 The tracker decides whether a pull request exists at all. If your tracker closes work through PRs, or you ask for one, the skill opens a draft PR after the first merge and marks it ready at the end. Otherwise the run stops on the integration branch with every ticket resolved the way your tracker closes work, which works fully offline against a local markdown tracker.
 
@@ -45,19 +47,19 @@ No, not any more. One user who liked the in-progress version had exactly this co
 
 **Its review and fix loop ran for hours, or kept "fixing" tickets that hadn't been built yet.**
 
-Both happen when `code-review` runs anywhere other than the one point the skill gives it. It compares the code against the whole spec, so it only makes sense once every ticket has landed. If it runs mid-run, every unbuilt ticket reads as a failure. The agent then builds that ticket, and that triggers another review. At the end, the skill runs `code-review` once and sends every finding to one fix subagent, but it doesn't yet say when to stop after that fix. One user reported a five-ticket feature where "the review and fix loop took roughly four hours". If you see a second broad review start, tell it to run focused checks for the fixed findings and stop. Expect that first review to find real problems. The run's output is a draft that the review completes, not something to ship on its own.
+The default is one full review after every ticket has landed, followed by a fix pass, verification, and one targeted fresh re-review of the findings and affected behavior. Remaining blockers pause the run with the PR still draft. This bounds the review loop instead of repeatedly reviewing the whole spec. If your repository requires intermediate wave reviews, those reviews cover completed work and leave later tickets as planned work.
 
 **Does it drive tdd like implement does?**
 
-It does now, though it didn't at first. Users running the in-progress version noticed that "the implementer subagents don't inherit the /tdd directive", so red-green stopped as soon as they scaled up from one ticket to a whole spec. Each implementer now builds its ticket with `tdd`. There is still no step where you agree seams interactively, as there is in an `implement` session, so name the seams in the spec or the tickets if you want them pinned.
+Yes. Each implementer calls `tdd` and builds one red-green slice at a time. It records public test seams and their trade-offs before writing tests, without routine approval. Name seams in the spec or tickets if you want them pinned; unresolved product or architectural choices still need your input.
 
 **Two implementers running in parallel collided on the same file, or picked different names for the same thing.**
 
-Worktrees don't remove collisions; they postpone them to merge time. A blocking edge written from ticket text is a guess about which files each ticket will touch, and two tickets on "different parts of the codebase" still share a message catalogue, a config registry, or a type. Each implementer sees only its own ticket and the shared notes, never the other's work in progress, so one user's web and mobile tickets added the same string as `blockedSince` and `blockedOn`. When two frontier tickets touch one shared file, either add a blocking edge between them so they run one after the other, or have the exploration notes fix the exact names each ticket adds.
+Worktrees postpone collisions until merge time. The orchestrator checks which files and interfaces tickets will change before dispatch, runs independent tickets together, and serializes overlapping work. Shared exploration notes can pin names and contracts, but they do not make overlapping edits independent.
 
 **Blocked tickets never start, even after their blocker has merged.**
 
-This is a known problem on GitHub. The tracker's blocked-by count only drops when a blocker *closes*, and tickets typically close when the PR merges, which is the end of the run. The tracker is the right source for the starting graph but a stale one mid-run. Tell the orchestrator to track which tickets have merged into the integration branch itself and compute the frontier from that.
+Tracker closure can lag behind integration, especially when issues close only after the PR merges. The orchestrator computes the ready frontier from tickets already merged into the integration branch, so later tickets can start while the issues remain open.
 
 **Does this replace Sandcastle or an AFK script?**
 
@@ -65,15 +67,18 @@ No. People ask because the skills now reach into implementation: "is Sandcastle 
 
 **A ticket's key test was skipped inside its worktree, and it reported green.**
 
-A worktree holds only what git tracks. Tests that read gitignored fixtures, local databases, or credentials can silently skip there. For a ticket whose verification depends on untracked material, tell the orchestrator to run it in the main checkout instead.
+A worktree holds only what git tracks. Tests that read gitignored fixtures, local databases, or credentials can silently skip there. Skipped or unavailable required checks now remain explicit verification gaps. The ticket cannot be reported as verified until those checks run in an environment with the necessary material.
 
 ## It's working if
 
-- Several implementers are running at once whenever the graph allows, not one after another.
+- Independent ready tickets run concurrently; tickets changing shared files or interfaces run sequentially.
 - A ticket starts as soon as its last blocker lands on the integration branch, not when the whole run ends.
 - Every ticket's trace shows `tdd` running, with a failing test before the code.
 - Merges into the integration branch are fast-forwards, not conflict resolutions.
-- The run ends on one branch with every ticket resolved, and a PR only if your tracker wanted one.
+- Acceptance checklists and required verification pass before the PR becomes ready or branch-only work is resolved.
+- Review fixes get one targeted re-review; remaining blockers are reported instead of triggering another broad loop.
+- A PR exists only if you requested it or the tracker requires one.
+- Worktrees containing unintegrated work are preserved and reported.
 
 ## Where it fits
 
